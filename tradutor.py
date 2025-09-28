@@ -1,200 +1,112 @@
-# tradutor.py - Tradução de áudio em tempo real (console)
-
-# --- 1. Importações ---
-import sounddevice as sd
-import numpy as np
+# tradutor.py - Módulo de Lógica de Transcrição e Tradução
 import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-# 'faster-whisper' é uma implementação otimizada do Whisper
 try:
     from faster_whisper import WhisperModel
 except ImportError:
-    print("AVISO: Instale 'faster-whisper' e 'openvino' com: pip install faster-whisper openvino")
-    exit()
-import queue      # Fila para comunicação entre threads
-import threading  # Processamento em segundo plano
-import os         # Limpeza de tela
+    print("ERRO CRÍTICO: Instale 'faster-whisper' com: pip install faster-whisper")
+    raise
 
-# --- 2. Configurações ---
-# Áudio
-SAMPLE_RATE = 16000
-CHANNELS = 1
-DTYPE = 'float32'
-BLOCK_SIZE = 1024  # Tamanho do bloco para o callback de áudio
-
-# Processamento (otimizado para baixa latência)
-CHUNK_SECONDS = 3  # Tamanho do chunk de áudio para processamento (em segundos)
-CHUNK_SAMPLES = int(CHUNK_SECONDS * SAMPLE_RATE)
-SLIDE_SECONDS = 1  # Sobreposição da janela deslizante (em segundos)
-SLIDE_SAMPLES = int(SLIDE_SECONDS * SAMPLE_RATE)
-
-# Modelos
-WHISPER_MODEL_NAME = "base"
-TRANSLATION_MODEL_NAME = "facebook/nllb-200-distilled-600M"
-
-# Idiomas (formato NLLB)
-SOURCE_LANG = "por_Latn"  # Português
-TARGET_LANG = "eng_Latn"  # Inglês
-
-# --- 3. Detecção de Hardware ---
-print("Verificando a disponibilidade de aceleradores de hardware (GPU)...")
-
-DEVICE = "cpu"  # Padrão: CPU
-message = "Nenhum acelerador de hardware encontrado. Usando CPU (pode ser mais lento)."
-
-# Ordem de preferência: CUDA > MPS > OpenVINO > XPU
-if torch.cuda.is_available():  # GPUs NVIDIA/AMD
-    DEVICE = "cuda"
-    message = "GPU NVIDIA (CUDA) ou AMD (ROCm) encontrada! Usando para aceleração."
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():  # Apple Silicon
-    DEVICE = "mps"
-    message = "GPU Apple Silicon (MPS) encontrada! Usando para aceleração."
-else:
-    try:
-        import openvino as ov
-        DEVICE = "openvino"
-        message = "Intel OpenVINO detectado! Usando para aceleração em CPU/iGPU."
-    except ImportError:
-        pass # Se OpenVINO não estiver instalado, continua a verificação
-
-    try:
-        import intel_extension_for_pytorch as ipex
-        if torch.xpu.is_available():
-            DEVICE = "xpu"
-            message = "GPU Intel (XPU) encontrada! Usando para aceleração.\nAVISO: O modelo Whisper pode não ser totalmente compatível com XPU nativamente."
-    except ImportError:
-        pass
-
-print(message)
-
-# --- 4. Carregamento dos Modelos ---
-print(f"\nCarregando modelo de transcrição Whisper ({WHISPER_MODEL_NAME}) via faster-whisper...")
-
-# Parâmetros de carregamento do Whisper com base no hardware
-whisper_device = "openvino" if DEVICE == "openvino" else DEVICE
-compute_type = "int8" if DEVICE in ["openvino", "cpu"] else "float16" if DEVICE == "cuda" else "default"
-model_kwargs = {}
-if whisper_device == "openvino":
-    model_kwargs["openvino_device"] = "GPU"
-
+# Verifica a dependência opcional para o filtro VAD
 try:
-    print(f"Tentando carregar com device='{whisper_device}', compute_type='{compute_type}', kwargs={model_kwargs}...")
-    whisper_model = WhisperModel(WHISPER_MODEL_NAME, device=whisper_device, compute_type=compute_type, **model_kwargs)
-    print("Modelo Whisper carregado com sucesso.")
+    import onnxruntime
+    VAD_AVAILABLE = True
+except ImportError:
+    VAD_AVAILABLE = False
 
-except Exception as e:
-    print(f"\nAVISO: Falha ao carregar o modelo com '{DEVICE}'. Erro: {e}")
-    print("Tentando carregar o modelo em modo de compatibilidade (CPU)...")
 
-    # Fallback para CPU
-    DEVICE = "cpu"
-    whisper_device = "cpu"
-    compute_type = "int8"
-    
-    try:
-        whisper_model = WhisperModel(WHISPER_MODEL_NAME, device=whisper_device, compute_type=compute_type)
-        print("Modelo Whisper carregado com sucesso em modo de compatibilidade (CPU).")
-    except Exception as e_cpu:
-        print(f"ERRO CRÍTICO: Falha ao carregar o modelo Whisper até mesmo na CPU. Erro: {e_cpu}")
-        print(f"Verifique sua instalação do 'faster-whisper' e se o modelo '{WHISPER_MODEL_NAME}' é válido.")
-        exit()
+class Tradutor:
+    """
+    Encapsula o carregamento dos modelos e a lógica de processamento de áudio
+    (transcrição e tradução), tornando-a reutilizável.
+    """
 
-print(f"\nCarregando modelo de tradução ({TRANSLATION_MODEL_NAME})...")
-# O modelo de tradução não tem backend "openvino", então usa CPU nesse caso.
-translation_device = "cpu" if DEVICE in ["openvino", "cpu"] else DEVICE
-translation_tokenizer = AutoTokenizer.from_pretrained(TRANSLATION_MODEL_NAME, src_lang=SOURCE_LANG)
-translation_model = AutoModelForSeq2SeqLM.from_pretrained(TRANSLATION_MODEL_NAME).to(translation_device)
-print(f"Modelo de tradução carregado com sucesso no dispositivo '{translation_device}'.")
+    def __init__(self, whisper_model_name, translation_model_name, status_callback=None, error_callback=None):
+        """
+        Inicializa o tradutor.
 
-# --- 5. Processamento em Tempo Real ---
-# Fila para comunicação entre a captura de áudio e a thread de processamento
-audio_queue = queue.Queue()
+        Args:
+            whisper_model_name (str): Nome do modelo Whisper a ser usado.
+            translation_model_name (str): Nome do modelo de tradução a ser usado.
+            status_callback (callable, optional): Função para reportar o progresso do carregamento.
+            error_callback (callable, optional): Função para reportar erros.
+        """
+        self.whisper_model_name = whisper_model_name
+        self.translation_model_name = translation_model_name
+        self.status_callback = status_callback or (lambda msg: print(msg))
+        self.error_callback = error_callback or (lambda err: print(f"ERRO: {err}"))
 
-def audio_callback(indata, frames, time, status):
-    """Callback do sounddevice, chamado para cada novo bloco de áudio."""
-    if status:
-        print(status)
-    audio_queue.put(indata.copy())
+        self.whisper_model = None
+        self.translation_model = None
+        self.translation_tokenizer = None
+        self.device = "cpu"
 
-def process_audio_thread():
-    """Thread que processa o áudio da fila."""
-    print("\nThread de processamento iniciada. Ouvindo o microfone...")
+    def _report_status(self, message):
+        if self.status_callback:
+            self.status_callback(message)
 
-    # Buffer para acumular o áudio
-    audio_buffer = np.array([], dtype=DTYPE)
+    def _report_error(self, error_message):
+        if self.error_callback:
+            self.error_callback(error_message)
 
-    while True:
+    def load_models(self):
+        """Carrega os modelos de IA, utilizando os callbacks para reportar o status."""
         try:
-            # Pega o áudio da fila (bloqueante)
-            audio_chunk = audio_queue.get()
-            audio_buffer = np.concatenate((audio_buffer, audio_chunk.flatten()))
+            self._report_status("Verificando aceleradores de hardware...")
 
-            # Se temos áudio suficiente no buffer, processamos
-            if len(audio_buffer) >= CHUNK_SAMPLES:
+            if torch.cuda.is_available():
+                self.device = "cuda"
+                compute_type = "float16"
+                self._report_status("Usando GPU NVIDIA (CUDA).")
+            else:
+                self.device = "cpu"
+                compute_type = "int8"
+                self._report_status("Usando CPU.")
 
-                # Pega a quantidade exata de áudio para processar
-                process_data = audio_buffer[:CHUNK_SAMPLES]
-                # Janela deslizante: remove apenas uma parte do início do buffer
-                audio_buffer = audio_buffer[SLIDE_SAMPLES:]
+            self._report_status(f"Carregando modelo Whisper '{self.whisper_model_name}'...")
+            self.whisper_model = WhisperModel(self.whisper_model_name, device=self.device, compute_type=compute_type)
 
-                # --- Transcrição ---
-                # Otimizações: VAD (Voice Activity Detection) para ignorar silêncio
-                # e beam_size=1 para maior velocidade.
-                segments, info = whisper_model.transcribe(
-                    process_data, 
-                    language='pt', 
-                    beam_size=1, 
-                    vad_filter=True, 
-                    vad_parameters=dict(min_silence_duration_ms=500)
-                )
-                transcribed_text = "".join(segment.text for segment in segments).strip()
+            self._report_status(f"Carregando modelo de tradução '{self.translation_model_name}'...")
+            self.translation_tokenizer = AutoTokenizer.from_pretrained(self.translation_model_name, src_lang="por_Latn")
+            self.translation_model = AutoModelForSeq2SeqLM.from_pretrained(self.translation_model_name).to(self.device)
 
-                # Ignora transcrições vazias ou muito curtas
-                if not transcribed_text or len(transcribed_text) < 3:
-                    continue
-
-                print(f"PT > {transcribed_text}")
-
-                # --- Tradução ---
-                tokenized_text = translation_tokenizer(transcribed_text, return_tensors="pt").to(translation_device)
-
-                translated_tokens = translation_model.generate(
-                    **tokenized_text,
-                    forced_bos_token_id=translation_tokenizer.convert_tokens_to_ids(TARGET_LANG)
-                )
-
-                translated_text = translation_tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)[0]
-                
-                print(f"EN > {translated_text}\n" + "-"*40)
-
+            self._report_status("Modelos carregados. Pronto para iniciar.")
+            return True
         except Exception as e:
-            print(f"Ocorreu um erro na thread de processamento: {e}")
-            break
+            self._report_error(f"Erro ao carregar modelos: {e}")
+            return False
 
-# --- 6. Função Principal ---
-def main():
-    os.system('cls' if os.name == 'nt' else 'clear')
-    print("==================================================")
-    print("      INICIANDO O TRADUTOR EM TEMPO REAL      ")
-    print("==================================================")
+    def process_chunk(self, audio_chunk):
+        """
+        Processa um pedaço de áudio, realizando a transcrição e a tradução.
 
-    # Cria e inicia a thread de processamento
-    processor = threading.Thread(target=process_audio_thread, daemon=True)
-    processor.start()
+        Args:
+            audio_chunk (np.array): O array de áudio a ser processado.
 
-    # Inicia a captura de áudio
-    try:
-        with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE, blocksize=BLOCK_SIZE, callback=audio_callback):
-            print("\nO programa está rodando. Fale continuamente.")
-            print("Pressione ENTER para parar.")
-            input() # Aguarda o Enter do usuário
+        Returns:
+            tuple[str, str] | None: Uma tupla contendo (texto_transcrito, texto_traduzido) ou None se não houver texto.
+        """
+        if not all([self.whisper_model, self.translation_model, self.translation_tokenizer]):
+            self._report_error("Modelos não foram carregados antes do processamento.")
+            return None
 
-    except Exception as e:
-        print(f"\nOcorreu um erro ao iniciar a captura de áudio: {e}")
-    finally:
-        print("\nEncerrando o programa... Até mais!")
+        # --- Transcrição ---
+        segments, _ = self.whisper_model.transcribe(
+            audio_chunk, language='pt', beam_size=1, vad_filter=VAD_AVAILABLE,
+            vad_parameters=dict(min_silence_duration_ms=500)
+        )
+        transcribed_text = "".join(segment.text for segment in segments).strip()
 
-# --- Ponto de Entrada ---
-if __name__ == "__main__":
-    main()
+        if not transcribed_text or len(transcribed_text) < 3:
+            return None
+
+        # --- Tradução ---
+        tokenized_text = self.translation_tokenizer(transcribed_text, return_tensors="pt").to(self.device)
+        translated_tokens = self.translation_model.generate(
+            **tokenized_text,
+            forced_bos_token_id=self.translation_tokenizer.convert_tokens_to_ids("eng_Latn")
+        )
+        translated_text = self.translation_tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)[0]
+
+        return transcribed_text, translated_text

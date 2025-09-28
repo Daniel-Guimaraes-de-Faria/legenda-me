@@ -1,19 +1,12 @@
-# tradutor_gui.py - Tradução de áudio em tempo real com interface (PyQt6)
+# interface_ui.py - Interface Gráfica para o Tradutor de Áudio
 import sys
 import queue
 import numpy as np
-import sounddevice as sd
-import torch
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel)
 from PyQt6.QtCore import QThread, QObject, pyqtSignal, pyqtSlot, Qt, QPoint
 from PyQt6.QtGui import QMouseEvent, QFont
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-
-try:
-    from faster_whisper import WhisperModel
-except ImportError:
-    print("ERRO CRÍTICO: Instale 'faster-whisper' com: pip install faster-whisper")
-    sys.exit(1)
+from tradutor import Tradutor
+from capture_mic import MicCapture
 
 # --- 1. Configurações ---
 SAMPLE_RATE = 16000
@@ -45,54 +38,26 @@ class Worker(QObject):
         super().__init__()
         self.audio_queue = audio_queue
         self.running = False
-        self.whisper_model = None
-        self.translation_model = None
-        self.translation_tokenizer = None
-        self.translation_device = "cpu"
+        # O processador agora é um membro do worker
+        self.processor = Tradutor(
+            whisper_model_name=WHISPER_MODEL_NAME,
+            translation_model_name=TRANSLATION_MODEL_NAME,
+            status_callback=self.status_updated.emit,
+            error_callback=self.error_occurred.emit
+        )
 
     def stop(self):
         """Sinaliza para a thread parar."""
         self.running = False
 
     def load_models(self):
-        """Carrega os modelos de IA, emitindo sinais de status para a GUI."""
-        try:
-            self.status_updated.emit("Verificando aceleradores de hardware...")
-
-            # Lógica de detecção de dispositivo (simplificada)
-            if torch.cuda.is_available():
-                DEVICE = "cuda"
-                compute_type = "float16"
-                self.status_updated.emit("Usando GPU NVIDIA (CUDA).")
-            else:
-                DEVICE = "cpu"
-                compute_type = "int8"
-                self.status_updated.emit("Usando CPU.")
-
-            self.translation_device = DEVICE
-
-            self.status_updated.emit(f"Carregando modelo Whisper '{WHISPER_MODEL_NAME}'...")
-            self.whisper_model = WhisperModel(WHISPER_MODEL_NAME, device=DEVICE, compute_type=compute_type)
-            
-            self.status_updated.emit(f"Carregando modelo de tradução '{TRANSLATION_MODEL_NAME}'...")
-            self.translation_tokenizer = AutoTokenizer.from_pretrained(TRANSLATION_MODEL_NAME, src_lang="por_Latn")
-            self.translation_model = AutoModelForSeq2SeqLM.from_pretrained(TRANSLATION_MODEL_NAME).to(self.translation_device)
-
-            self.status_updated.emit("Modelos carregados. Pronto para iniciar.")
-        except Exception as e:
-            error_msg = f"Erro ao carregar modelos: {e}"
-            self.error_occurred.emit(error_msg)
+        """Delega o carregamento dos modelos para o AudioProcessor."""
+        if not self.processor.load_models():
             self.stop()
 
     @pyqtSlot()
     def process_audio(self):
         """Loop principal de processamento de áudio."""
-        if not all([self.whisper_model, self.translation_model, self.translation_tokenizer]):
-            self.load_models()
-            if not self.whisper_model: # Se o carregamento falhou
-                self.finished.emit()
-                return
-
         self.processing_started.emit()
         self.running = True
         audio_buffer = np.array([], dtype=DTYPE)
@@ -107,32 +72,13 @@ class Worker(QObject):
                     process_data = audio_buffer[:CHUNK_SAMPLES]
                     audio_buffer = audio_buffer[SLIDE_SAMPLES:]
 
-                    # --- Transcrição ---
-                    # Otimizações: VAD para ignorar silêncio e beam_size=1 para velocidade.
-                    segments, info = self.whisper_model.transcribe(
-                        process_data, 
-                        language='pt', 
-                        beam_size=1, 
-                        vad_filter=True, 
-                        vad_parameters=dict(min_silence_duration_ms=500)
-                    )
-                    transcribed_text = "".join(segment.text for segment in segments).strip()
+                    # Delega o processamento para a classe especializada
+                    result = self.processor.process_chunk(process_data)
 
-                    if not transcribed_text or len(transcribed_text) < 3:
-                        continue
-
-                    self.transcribed_text_updated.emit(transcribed_text)
-
-                    # --- Tradução ---
-                    tokenized_text = self.translation_tokenizer(transcribed_text, return_tensors="pt").to(self.translation_device)
-
-                    translated_tokens = self.translation_model.generate(
-                        **tokenized_text,
-                        forced_bos_token_id=self.translation_tokenizer.convert_tokens_to_ids("eng_Latn")
-                    )
-
-                    translated_text = self.translation_tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)[0]
-                    self.translated_text_updated.emit(translated_text)
+                    if result:
+                        transcribed_text, translated_text = result
+                        self.transcribed_text_updated.emit(transcribed_text)
+                        self.translated_text_updated.emit(translated_text)
 
             except queue.Empty:
                 # Timeout, apenas continua o loop para verificar self.running
@@ -153,7 +99,6 @@ class SubtitleWindow(QMainWindow):
         
         # Variáveis de estado
         self.is_running = False
-        self.audio_stream = None
         self.display_mode = "EN" # "EN", "PT", "SPLIT"
         self.last_pt_text = ""
         self.last_en_text = ""
@@ -163,6 +108,10 @@ class SubtitleWindow(QMainWindow):
         self.worker_thread = None
         self.worker = None
         self.audio_queue = queue.Queue()
+
+        # Módulo de captura de áudio
+        self.mic_capture = MicCapture(self.audio_queue, SAMPLE_RATE, CHANNELS, DTYPE, BLOCK_SIZE)
+
 
         # Widget para redimensionamento
         self.grip = None
@@ -302,15 +251,8 @@ class SubtitleWindow(QMainWindow):
 
     def start_translation(self):
         try:
-            def audio_callback(indata, frames, time, status):
-                if self.is_running: self.audio_queue.put(indata.copy())
+            self.mic_capture.start()
 
-            self.audio_stream = sd.InputStream(
-                samplerate=SAMPLE_RATE, channels=CHANNELS,
-                dtype=DTYPE, blocksize=BLOCK_SIZE, callback=audio_callback
-            )
-            self.audio_stream.start()
-            
             # Inicia o processamento na thread do worker
             self.start_processing_signal.emit()
             
@@ -327,11 +269,7 @@ class SubtitleWindow(QMainWindow):
         self.is_running = False
         self.start_stop_button.setText("▶")
         self.update_subtitle_text("Tradução parada.")
-        
-        if self.audio_stream:
-            self.audio_stream.stop()
-            self.audio_stream.close()
-            self.audio_stream = None
+        self.mic_capture.stop()
 
         # Para o loop do worker e limpa a fila de áudio
         if self.worker:
